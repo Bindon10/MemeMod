@@ -1,0 +1,1213 @@
+// Measure melee state machine. Included by every generated MemeWeapon_* class.
+// Owning client and server both run it from the same inputs; the server alone decides
+// anything touching another pawn and pushes it with the Client* RPCs below.
+
+const STG_HIT = 0;
+const STG_KICK = 1;
+const STG_BREAK = 2;
+const STG_INTERRUPT = 3;
+const RC_PARRIED = 0;
+const RC_CLASH = 1;
+const RC_WORLD = 2;
+const RC_BLOCKED = 3;
+const CT_HIT = 0;
+const CT_BLOCKED = 1;
+
+var byte  MAtk;
+var bool  bMAlt;
+var bool  bMChain;
+var bool  bMRiposte;
+var bool  bMReleaseCombo;
+var byte  MLastAtk;
+var bool  bMLastCombo;
+var bool  bMContact;
+var byte  MChainAtk;
+var bool  bMChainAlt;
+var bool  bMChainParry;
+var byte  MBufAtk;
+var bool  bMBufAlt;
+var bool  bMBufParry;
+var float MStateStart;
+var float MStateLength;
+var float MCommitAt;
+var float MMorphProgress;
+var float MParryWindowEnd;
+var float MRiposteUntil;
+var bool  bMGuardHeld;
+var bool  bMBlocked;
+var byte  MRecoilCause;
+var float MRecoilLength;
+var bool  bMChainAfterRecoil;
+var byte  MStaggerKind;
+var bool  bMGuardBroken;
+var float SrvStrikeStart;
+var int   MSerial;
+var int   MFailSerial;
+
+// Tunables: defaults in MemeWeaponTuning.uci, live values copied from MemeTuning
+var byte  MMass;
+var float MCommitFraction;
+var float MServerCommitSlack;
+var float MChainWindupScale;
+var float MRiposteWindupScale;
+var float MRiposteWindow;
+var float MParryWindow;
+var float MContactRecoveryScale;
+var float MKickWhiffRecovery;
+var float MRecoveryParryFraction;
+var float MGuardMoveScale;
+var float MGuardDropTime;
+var float MMissedParryRecovery;
+var float MFeintTime;
+var float MFeintCost;
+var float MStaggerHit;
+var float MStaggerKick;
+var float MStaggerBreak;
+var float MStaggerParryFraction;
+// Turn caps as fractions of the weapon's vanilla attack turn speeds.
+var float MWindupTurn;
+var float MStrikeTurn;
+var float MStabStrikeTurn;
+var float MHoldMax;
+var float MHoldCost;
+var bool  bMHoldOnAttackButton;
+var int   MTuneVersion;
+var MemeTuning MTuneRef;
+var bool  bMHoldBtn;
+var byte  MHoldMode;
+
+`include(MemeMod/Include/MemeWeaponSync.uci)
+
+// ---------------------------------------------------------------- queries
+
+simulated function bool MemeIsStriking() { return IsInState('MStrike'); }
+simulated function bool MemeIsWindingUp() { return IsInState('MWindup') || IsInState('MHold'); }
+simulated function bool MemeIsHolding() { return IsInState('MHold'); }
+simulated function bool MemeIsVulnerable() { return IsInState('MRecovery') || IsInState('MGuardDrop') || IsInState('MStagger') || IsInState('MRecoil') || IsInState('MFeint'); }
+simulated function bool MemeIsGuarding() { return IsInState('MParry') && !bMGuardBroken; }
+simulated function bool MemeInParryWindow() { return IsInState('MParry') && !bEquipShield && WorldInfo.TimeSeconds <= MParryWindowEnd; }
+simulated function bool MemeIsHyperArmored() { return IsInState('MStrike') && (bMRiposte || MAtk == Attack_Sprint); }
+simulated function bool MemeIsStaggered() { return IsInState('MStagger'); }
+simulated function bool MemeIsShieldGuard() { return bEquipShield; }
+simulated function float MemeStrikeStart() { return SrvStrikeStart; }
+simulated function byte MemeAttackType() { return MAtk; }
+simulated function bool MemeAttackIsAlt() { return bMAlt || bMReleaseCombo; }
+simulated function byte MemeMassClass() { return MMass; }
+simulated function float MemeWindupEnd()
+{
+	if (IsInState('MHold'))
+		return WorldInfo.TimeSeconds + 0.05f;
+	return IsInState('MWindup') ? MStateStart + MStateLength : 0.f;
+}
+simulated function bool MemeCanFeint() { return IsInState('MWindup') && MemeBeforeCommit() && !bMRiposte && MAtk != Attack_Sprint && MAtk != Attack_Shove; }
+simulated function bool MemeHasMeasureBrain()
+{
+	return AOCOwner.Controller != none && (AOCOwner.Controller.IsA('MemeAIController') || AOCOwner.Controller.IsA('MemeAIDuelController'));
+}
+simulated function bool MemeCanRiposte() { return IsInState('MParry') && MRiposteUntil > WorldInfo.TimeSeconds; }
+
+simulated function float MemeStrikeProgress()
+{
+	if (!IsInState('MStrike') || MStateLength <= 0.f)
+		return 0.f;
+	return FClamp((WorldInfo.TimeSeconds - MStateStart) / MStateLength, 0.f, 1.f);
+}
+
+simulated function bool MemeGetTurnCaps(out float YawCap, out float PitchCap)
+{
+	if (MAtk == Attack_Sprint || MAtk == Attack_Shove || AttackHorizRotateSpeed <= 0.f)
+		return false;
+	if (IsInState('MStrike'))
+	{
+		YawCap = AttackHorizRotateSpeed * ((MAtk == Attack_Stab) ? MStabStrikeTurn : MStrikeTurn);
+		PitchCap = VerticalRotateSpeed * MStrikeTurn;
+		return true;
+	}
+	if (IsInState('MWindup') || IsInState('MHold'))
+	{
+		YawCap = AttackHorizRotateSpeed * MWindupTurn;
+		PitchCap = VerticalRotateSpeed * MWindupTurn;
+		return true;
+	}
+	return false;
+}
+
+simulated function bool IsInCombo() { return bMChain; }
+simulated function bool CanSwitch() { return IsInState('Active') && bCanSwitchWeapons; }
+
+// Vanilla resync would yank the server out of server-forced states.
+reliable server function SyncServerToState(name NewState, int NewFireMode) {}
+simulated function NotifyHitPawn() {}
+
+// ---------------------------------------------------------------- helpers
+
+simulated function float MemeSlack()
+{
+	if (Role == ROLE_Authority && AOCOwner != none && !AOCOwner.IsLocallyControlled())
+		return MServerCommitSlack;
+	return 0.f;
+}
+
+simulated function float MemeRiposteSlack()
+{
+	if (Role == ROLE_Authority && MemeModPawn(AOCOwner) != none && !AOCOwner.IsLocallyControlled())
+		return FMin(MemeModPawn(AOCOwner).MemeRTT() + 0.05f, 0.3f);
+	return 0.f;
+}
+
+simulated function bool MemeRemoteOwner()
+{
+	return Role == ROLE_Authority && WorldInfo.NetMode != NM_Standalone && AOCOwner != none && !AOCOwner.IsLocallyControlled();
+}
+
+// Every attack press passes through here, so it also records whether that press can be held.
+// Only Fire and AltFire send a release; wheel, stab and alt-attack binds never do.
+simulated function bool MemeDecode(byte FireModeNum, out byte Atk, out byte bAltOut)
+{
+	if (!IsInState('MHold') && !(IsInState('MWindup') && !MemeBeforeCommit()))
+	{
+		bMHoldBtn = (FireModeNum == 0 || FireModeNum == 1) && AOCOwner != none && AOCOwner.IsHumanControlled();
+		MHoldMode = FireModeNum;
+		// Presses replayed after the button is up (dodge-queued attacks) must not hold.
+		if (bMHoldBtn && AOCOwner.IsLocallyControlled() && MemeModPawn(AOCOwner) != none && !MemeModPawn(AOCOwner).MemeFireDown(FireModeNum))
+			StopFire(FireModeNum);
+	}
+	bAltOut = 0;
+	if (FireModeNum == Attack_AltSlash)
+	{
+		Atk = Attack_Slash;
+		bAltOut = 1;
+	}
+	else if (FireModeNum == Attack_AltOverhead)
+	{
+		Atk = Attack_Overhead;
+		bAltOut = 1;
+	}
+	else
+	{
+		Atk = FireModeNum;
+	}
+	if (bUseAlternateSide && (Atk == Attack_Slash || Atk == Attack_Overhead))
+		bAltOut = 1;
+	if (Atk == Attack_Overhead && bIgnoreAlternate)
+		bAltOut = 0;
+	if (bAltOut == 1 && WindupAnimations[Atk].AlternateAnimation == '')
+		bAltOut = 0;
+	return Atk == Attack_Slash || Atk == Attack_Overhead || Atk == Attack_Stab || Atk == Attack_Sprint || Atk == Attack_Shove;
+}
+
+simulated function MemeBuffer(byte FireModeNum)
+{
+	local byte Atk, AltB;
+
+	if (FireModeNum == Attack_Parry)
+	{
+		bMBufParry = true;
+		MBufAtk = Attack_Null;
+	}
+	else if (MemeDecode(FireModeNum, Atk, AltB) && Atk != Attack_Sprint)
+	{
+		MBufAtk = Atk;
+		bMBufAlt = AltB == 1;
+		bMBufParry = false;
+	}
+}
+
+simulated function MemeClearBuffer()
+{
+	MBufAtk = Attack_Null;
+	bMBufParry = false;
+}
+
+simulated function MemeConsumeBuffer()
+{
+	local byte Atk;
+	local bool bAlt;
+
+	if (bMBufParry)
+	{
+		MemeClearBuffer();
+		MemeEnterParry();
+		return;
+	}
+	if (MBufAtk != Attack_Null)
+	{
+		Atk = MBufAtk;
+		bAlt = bMBufAlt;
+		MemeClearBuffer();
+		MemeBeginAttack(Atk, bAlt, false, false);
+	}
+}
+
+simulated function MemeStartAction(byte FireModeNum)
+{
+	local byte Atk, AltB;
+
+	if (AOCOwner == none || AOCWepAttachment == none)
+		CacheWeaponReferences();
+
+	if (FireModeNum == Attack_Parry)
+	{
+		if (bCanParry)
+			MemeEnterParry();
+		return;
+	}
+	if (!MemeDecode(FireModeNum, Atk, AltB))
+		return;
+	if (Atk == Attack_Shove && bShoveCooldown)
+		return;
+	MemeBeginAttack(Atk, AltB == 1, false, false);
+}
+
+simulated function bool MemeWantsHold()
+{
+	local MemeModPawn P;
+
+	if (MHoldMax <= 0.f || bMRiposte || MAtk == Attack_Sprint || MAtk == Attack_Shove)
+		return false;
+	P = MemeModPawn(AOCOwner);
+	return (bMHoldBtn && bMHoldOnAttackButton) || (P != none && P.bMemeHoldKey);
+}
+
+simulated function MemeReleaseHold() {}
+simulated function MemeHoldTimeout() {}
+
+// Server started the strike; a client still holding follows so contact RPCs land in MStrike.
+reliable client function ClientMemeStrikeSync()
+{
+	if (IsInState('MHold'))
+		GotoState('MStrike');
+}
+
+simulated function EndFire(byte FireModeNum)
+{
+	super.EndFire(FireModeNum);
+	if (FireModeNum == MHoldMode && bMHoldBtn)
+	{
+		bMHoldBtn = false;
+		MemeReleaseHold();
+	}
+}
+
+simulated function MemeBeginAttack(byte Atk, bool bAlt, bool bChain, bool bRiposte)
+{
+	MemeSyncTuning();
+	MAtk = Atk;
+	bMAlt = bAlt;
+	bMChain = bChain;
+	bMRiposte = bRiposte;
+	MMorphProgress = 0.f;
+	if (IsInState('MWindup'))
+		GotoState('MWindup',,true);
+	else
+		GotoState('MWindup');
+}
+
+simulated function MemeChain()
+{
+	MLastAtk = MAtk;
+	bMLastCombo = bMReleaseCombo;
+	MemeBeginAttack(MChainAtk, bMChainAlt, true, false);
+}
+
+simulated function MemeEnterParry()
+{
+	MemeSyncTuning();
+	if (!bCanParry || bMGuardBroken)
+		return;
+	if (IsInState('MParry'))
+		return;
+	GotoState('MParry');
+}
+
+simulated function MemeFeintCost()
+{
+	if (Role == ROLE_Authority)
+		AOCOwner.ConsumeStamina(MFeintCost);
+}
+
+// Missing or zero-length animations must never strand a state.
+simulated function MemeArm(float Len)
+{
+	MSerial++;
+	MFailSerial = MSerial;
+	SetTimer(FMax(Len, 0.05f) + 0.2f, false, 'MemeFailsafe');
+}
+
+simulated function MemeFailsafe()
+{
+	if (MFailSerial == MSerial && !IsInState('Active') && !IsInState('MParry'))
+		OnStateAnimationEnd();
+}
+
+simulated function MemeCommitReached()
+{
+	bCanFeint = false;
+}
+
+simulated function bool MemeBeforeCommit()
+{
+	return WorldInfo.TimeSeconds < MCommitAt + MemeSlack();
+}
+
+simulated function MemeResetCombat()
+{
+	bMChain = false;
+	bMRiposte = false;
+	bMContact = false;
+	bMChainParry = false;
+	MChainAtk = Attack_Null;
+	MLastAtk = Attack_Null;
+	bMLastCombo = false;
+	bMBlocked = false;
+	bMGuardBroken = false;
+	SrvStrikeStart = 0.f;
+}
+
+simulated function byte MemeDazedIndex(EDirection Direction)
+{
+	if (Direction == EDIR_BOT)
+		return 0;
+	else if (Direction == EDIR_LEFT)
+		return 1;
+	else if (Direction == EDIR_TOP)
+		return 2;
+	else if (Direction == EDIR_RIGHT)
+		return 3;
+	else if (Direction == EDIR_BOTLEFT)
+		return 4;
+	else if (Direction == EDIR_BOTRIGHT)
+		return 5;
+	else if (Direction == EDIR_TOPLEFT)
+		return 6;
+	return 7;
+}
+
+// Index into DirParryHitAnimations: 0/1 slashes by side, 2 overhead, 3 stab.
+static function byte MemeParryDir(byte Atk, bool bAltSide)
+{
+	if (Atk == Attack_Slash && bAltSide)
+		return 1;
+	if (Atk == Attack_Slash)
+		return 0;
+	if (Atk == Attack_Stab)
+		return 3;
+	return 2;
+}
+
+simulated function MemePlayParryHit(byte Dir)
+{
+	local AnimationInfo Info;
+
+	if (bEquipShield)
+	{
+		Info = OtherParryAnimations[0];
+		AOCOwner.ReplicateCompressedAnimation(Info, EWST_ShieldUpIdle, 0);
+	}
+	else if (Dir < DirParryHitAnimations.Length && DirParryHitAnimations[Dir].AnimationName != '')
+	{
+		Info = DirParryHitAnimations[Dir];
+		Info.bUseAltNode = false;
+		Info.fBlendListNodeTime = 0.f;
+		AOCOwner.ReplicateCompressedAnimation(Info, EWST_ParryRelease, Dir);
+	}
+}
+
+// ---------------------------------------------------------------- vanilla entry points
+
+simulated function ActivateParry() { MemeEnterParry(); }
+
+// Releasing block cancels a buffered parry; MParry overrides this.
+simulated function LowerShield() { bMBufParry = false; }
+simulated function MemeParryWindowOver() {}
+
+simulated function ActivateFlinch(bool bFullBody, EDirection Direction, bool bGeneric, bool bSpecial, bool bHitFromTwoHander)
+{
+	CacheWeaponReferences();
+	if (Role < ROLE_Authority)
+		return;
+	if (bSpecial)
+		MemeServerStaggerDir(STG_BREAK, MemeDazedIndex(Direction));
+	else
+		MemeServerStaggerDir(STG_HIT, MemeDazedIndex(Direction));
+}
+
+simulated function ActivateDeflect(bool bParry)
+{
+	if (Role == ROLE_Authority)
+		MemeServerRecoil(RC_PARRIED, 0.6f, false);
+}
+
+simulated function ActivateWorldDeflect()
+{
+	if (Role == ROLE_Authority)
+		MemeServerRecoil(RC_WORLD, 0.4f, false);
+}
+
+// A vanilla weapon was parried by us (flags, fists).
+simulated function NotifySuccessfulParry(EAttack Type, int Dir)
+{
+	if (Role == ROLE_Authority)
+		MemeServerBlocked(MemeInParryWindow(), MemeParryDir(Type, Dir == 1));
+}
+
+// ---------------------------------------------------------------- server-forced events
+
+function MemeServerStagger(byte Kind, vector FromLocation)
+{
+	CacheWeaponReferences();
+	MemeServerStaggerDir(Kind, MemeDazedIndex(AOCOwner.GetHitDirection(FromLocation)));
+}
+
+function MemeServerStaggerDir(byte Kind, byte Dir)
+{
+	if (IsInState('MStagger') && (MStaggerKind == STG_BREAK || Kind == STG_HIT))
+		return;
+	if (bNeverFlinch && Kind != STG_BREAK)
+		return;
+	MStaggerKind = Kind;
+	DirectionDazed = Dir;
+	AOCOwner.PauseHealthRegeneration();
+	GotoState('MStagger',,true);
+	if (MemeRemoteOwner())
+		ClientMemeStagger(Kind, Dir);
+}
+
+reliable client function ClientMemeStagger(byte Kind, byte Dir)
+{
+	CacheWeaponReferences();
+	MStaggerKind = Kind;
+	DirectionDazed = Dir;
+	AOCOwner.PlayFlinchEffects();
+	GotoState('MStagger',,true);
+}
+
+function MemeServerRecoil(byte Cause, float Length, bool bChainAfter)
+{
+	MRecoilCause = Cause;
+	MRecoilLength = Length;
+	bMChainAfterRecoil = bChainAfter;
+	GotoState('MRecoil',,true);
+	if (MemeRemoteOwner())
+		ClientMemeRecoil(Cause, Length, bChainAfter);
+}
+
+reliable client function ClientMemeRecoil(byte Cause, float Length, bool bChainAfter)
+{
+	CacheWeaponReferences();
+	MRecoilCause = Cause;
+	MRecoilLength = Length;
+	bMChainAfterRecoil = bChainAfter;
+	GotoState('MRecoil',,true);
+}
+
+function MemeServerBlocked(bool bPerfect, byte Dir)
+{
+	MemeOnBlocked(bPerfect, Dir);
+	if (MemeRemoteOwner())
+		ClientMemeBlocked(bPerfect, Dir);
+}
+
+reliable client function ClientMemeBlocked(bool bPerfect, byte Dir)
+{
+	MemeOnBlocked(bPerfect, Dir);
+}
+
+simulated function MemeOnBlocked(bool bPerfect, byte Dir)
+{
+	if (!IsInState('MParry'))
+		return;
+	bMBlocked = true;
+	if (bPerfect)
+	{
+		MRiposteUntil = WorldInfo.TimeSeconds + MRiposteWindow;
+		AOCOwner.OnActionSucceeded(EACT_Block);
+	}
+	MemePlayParryHit(Dir);
+}
+
+function MemeServerContact(byte Kind)
+{
+	bMContact = true;
+	if (MemeRemoteOwner())
+		ClientMemeContact(Kind);
+}
+
+reliable client function ClientMemeContact(byte Kind)
+{
+	if (IsInState('MStrike') || IsInState('MRecovery') || IsInState('MRecoil'))
+		bMContact = true;
+}
+
+// Server chained on contact the client had not heard about yet.
+reliable client function ClientMemeChain(byte Atk, bool bAlt)
+{
+	if (IsInState('MWindup') && bMChain)
+		return;
+	if (IsInState('MStrike') || IsInState('MRecovery'))
+	{
+		MChainAtk = Atk;
+		bMChainAlt = bAlt;
+		bMContact = true;
+		MemeChain();
+	}
+}
+
+reliable client function ClientMemeChainParry()
+{
+	if (IsInState('MStrike') || IsInState('MRecovery'))
+		MemeEnterParry();
+}
+
+// ---------------------------------------------------------------- states
+
+simulated state Active
+{
+	simulated event BeginState(Name PreviousStateName)
+	{
+		AttackQueue = Attack_Null;
+		ClearTimer('MemeFailsafe');
+		ForceEndFire();
+		super.BeginState(PreviousStateName);
+		MemeResetCombat();
+		AOCOwner.RemoveDebuff(EDEBF_ATTACK);
+		AOCOwner.RemoveDebuff(EDEBF_COMBO);
+		AOCOwner.StateVariables.bCanParry = true;
+		MemeSyncTuning();
+		MemeConsumeBuffer();
+	}
+
+	simulated function BeginFire(byte FireModeNum)
+	{
+		MemeStartAction(FireModeNum);
+	}
+
+	simulated function DoFeintAttack() {}
+}
+
+simulated state MWindup
+{
+	simulated event BeginState(Name PreviousStateName)
+	{
+		local AnimationInfo Info;
+		local float Len;
+		local bool bExtra;
+
+		CacheWeaponReferences();
+		SetCurrentFireMode(MAtk);
+		bMContact = false;
+		bMChainParry = false;
+		MChainAtk = Attack_Null;
+		bShieldRaised = false;
+		AOCOwner.StateVariables.bIsAttacking = true;
+		AOCOwner.StateVariables.bCanDodge = false;
+		AOCOwner.StateVariables.bIsParrying = false;
+		AOCOwner.StateVariables.bIsActiveShielding = false;
+		AOCOwner.bAltIsAttacking = true;
+		AOCOwner.bSprintConsumeStamina = true;
+		AOCOwner.NotifyPawnStartAttack();
+		AOCOwner.PlayerHUDStartSwing();
+		PrePawnState = AOCOwner.PawnState;
+		PrePawnVelocity = AOCOwner.Velocity;
+		if (MAtk == Attack_Sprint)
+		{
+			AOCOwner.InitSprintAttack();
+			AOCOwner.StateVariables.bCanJump = false;
+		}
+
+		bMReleaseCombo = bMAlt || (bMChain && MAtk == MLastAtk && !bMLastCombo && ReleaseAnimations[MAtk].ComboAnimation != '');
+
+		Info = WindupAnimations[MAtk];
+		bExtra = false;
+		if (bMAlt)
+		{
+			Info.AnimationName = Info.AlternateAnimation;
+			bExtra = true;
+		}
+		else if (bMReleaseCombo && Info.ComboAnimation != '')
+		{
+			Info.bCombo = true;
+		}
+		if (MAtk == Attack_Shove || MAtk == Attack_Sprint)
+			Info.bForceFullBody = true;
+
+		Len = GetRealAnimLength(Info);
+		if (bMRiposte)
+			Len *= MRiposteWindupScale;
+		else if (bMChain)
+			Len *= MChainWindupScale;
+
+		MStateLength = Len;
+		MStateStart = WorldInfo.TimeSeconds - Len * MMorphProgress;
+		Info.fAnimationLength = FMax(Len * (1.f - MMorphProgress), 0.05f);
+		MMorphProgress = 0.f;
+
+		if (bMRiposte || MAtk == Attack_Sprint || MAtk == Attack_Shove)
+			MCommitAt = MStateStart;
+		else
+			MCommitAt = MStateStart + Len * MCommitFraction;
+		bCanFeint = WorldInfo.TimeSeconds < MCommitAt;
+		if (bCanFeint)
+			SetTimer(MCommitAt - WorldInfo.TimeSeconds, false, 'MemeCommitReached');
+
+		AOCOwner.ReplicateCompressedAnimation(Info, EWST_Windup, MAtk, bExtra);
+		MemeArm(Info.fAnimationLength);
+	}
+
+	simulated event EndState(Name NextStateName)
+	{
+		ClearTimer('MemeCommitReached');
+		bCanFeint = false;
+	}
+
+	simulated function BeginFire(byte FireModeNum)
+	{
+		local byte Atk, AltB;
+
+		if (FireModeNum == Attack_Parry)
+		{
+			if (MemeBeforeCommit() && bCanParry && !bMRiposte)
+			{
+				MemeFeintCost();
+				AOCOwner.OnActionSucceeded(EACT_Feint);
+				MemeEnterParry();
+			}
+			else
+			{
+				bMChainParry = true;
+			}
+			return;
+		}
+		if (!MemeDecode(FireModeNum, Atk, AltB) || Atk == Attack_Sprint)
+			return;
+		if (MemeBeforeCommit() && !bMRiposte && MAtk != Attack_Sprint && MAtk != Attack_Shove)
+		{
+			if (Atk != MAtk || (AltB == 1) != bMAlt)
+			{
+				MemeFeintCost();
+				MMorphProgress = FClamp((WorldInfo.TimeSeconds - MStateStart) / FMax(MStateLength, 0.01f), 0.f, 0.95f);
+				MAtk = Atk;
+				bMAlt = AltB == 1;
+				GotoState('MWindup',,true);
+			}
+		}
+		else if (Atk != Attack_Shove)
+		{
+			MChainAtk = Atk;
+			bMChainAlt = AltB == 1;
+		}
+	}
+
+	simulated function DoFeintAttack()
+	{
+		if (!MemeBeforeCommit() || bMRiposte || MAtk == Attack_Sprint || MAtk == Attack_Shove)
+		{
+			AOCOwner.OnActionFailed(EACT_Feint);
+			return;
+		}
+		MemeFeintCost();
+		AOCOwner.OnActionSucceeded(EACT_Feint);
+		GotoState('MFeint');
+	}
+
+	simulated function OnStateAnimationEnd()
+	{
+		if (MemeWantsHold())
+			GotoState('MHold');
+		else
+			GotoState('MStrike');
+	}
+}
+
+// Delayed release: the windup's last frame stays up (blend nodes hold their final pose) until release or MHoldMax.
+simulated state MHold
+{
+	simulated event BeginState(Name PreviousStateName)
+	{
+		MStateStart = WorldInfo.TimeSeconds;
+		MStateLength = MHoldMax;
+		SetTimer(MHoldMax, false, 'MemeHoldTimeout');
+		MemeArm(MHoldMax);
+		if (Role == ROLE_Authority)
+			AOCOwner.ConsumeStamina(MHoldCost);
+	}
+
+	simulated event EndState(Name NextStateName)
+	{
+		ClearTimer('MemeHoldTimeout');
+	}
+
+	// Either input keeps the hold; it ends when neither does.
+	simulated function MemeReleaseHold()
+	{
+		if (!MemeWantsHold())
+			GotoState('MStrike');
+	}
+
+	simulated function MemeHoldTimeout()
+	{
+		GotoState('MStrike');
+	}
+
+	simulated function OnStateAnimationEnd()
+	{
+		GotoState('MStrike');
+	}
+
+	simulated function BeginFire(byte FireModeNum)
+	{
+		local byte Atk, AltB;
+
+		if (FireModeNum == Attack_Parry)
+			bMChainParry = true;
+		else if (MemeDecode(FireModeNum, Atk, AltB) && Atk != Attack_Shove && Atk != Attack_Sprint)
+		{
+			MChainAtk = Atk;
+			bMChainAlt = AltB == 1;
+		}
+	}
+
+	simulated function DoFeintAttack()
+	{
+		AOCOwner.OnActionFailed(EACT_Feint);
+	}
+}
+
+simulated state MFeint
+{
+	simulated event BeginState(Name PreviousStateName)
+	{
+		AOCOwner.ClearTimer('OnAttackAnimEnd');
+		AOCOwner.ManualReset(MFeintTime);
+		AOCOwner.PlayerHUDFlinched();
+		AOCOwner.FinishSprintAttack();
+		SetTimer(MFeintTime, false, 'MemeEndTimedState');
+	}
+
+	simulated event EndState(Name NextStateName)
+	{
+		ClearTimer('MemeEndTimedState');
+	}
+
+	simulated function BeginFire(byte FireModeNum)
+	{
+		if (FireModeNum == Attack_Parry)
+			MemeEnterParry();
+		else
+			MemeBuffer(FireModeNum);
+	}
+
+	simulated function DoFeintAttack() {}
+}
+
+simulated function MemeEndTimedState()
+{
+	GotoState('Active');
+}
+
+simulated state MStrike
+{
+	simulated event BeginState(Name PreviousStateName)
+	{
+		local AnimationInfo Info;
+
+		Info = ReleaseAnimations[MAtk];
+		Info.bCombo = bMReleaseCombo;
+		Info.bUseSlotSystem = false;
+		Info.bForceSameIndex = bMRiposte;
+		Info.bFullBody = !bMChain && !AOCOwner.bIsCrouching && AOCOwner.PawnState != ESTATE_DODGE;
+		if (MAtk == Attack_Shove || MAtk == Attack_Sprint)
+			Info.bForceFullBody = true;
+		if (MAtk == Attack_Shove)
+			Info.bUseRMM = true;
+
+		if (MAtk == Attack_Sprint)
+		{
+			AOCOwner.DisableSprint();
+			AOCOwner.Lunge();
+		}
+		else if (MAtk != Attack_Shove && !bMChain && !AOCOwner.bIsCrouching && AOCOwner.Physics != PHYS_Falling && AOCOwner.PawnState != ESTATE_DODGE)
+		{
+			if (VSize(AOCOwner.Velocity) > 2.0f)
+				AOCOwner.Lunge();
+			else
+				Info.bFullBody = false;
+		}
+
+		MStateStart = WorldInfo.TimeSeconds;
+		MStateLength = GetRealAnimLength(Info);
+		AOCOwner.ReplicateCompressedAnimation(Info, EWST_Release, MAtk);
+		MemeArm(MStateLength);
+
+		if (Role == ROLE_Authority)
+		{
+			SrvStrikeStart = WorldInfo.TimeSeconds - MemeModPawn(AOCOwner).MemeOneWay();
+			if (MemeRemoteOwner())
+				ClientMemeStrikeSync();
+			AOCOwner.PauseHealthRegeneration();
+			MemeModPawn(AOCOwner).MemeBeginStrike();
+		}
+		if (AOCOwner.PlayerReplicationInfo != none)
+			AOCPRI(AOCOwner.PlayerReplicationInfo).NumAttacks += 1;
+		if (MAtk <= Attack_Sprint)
+			AOCOwner.OnActionInitiated(EPlayerAction(MAtk + EACT_AttackSlash));
+	}
+
+	simulated event EndState(Name NextStateName)
+	{
+		AOCOwner.FinishSprintAttack();
+		AOCOwner.FinishLunge();
+		AOCOwner.ResetSprintSpeed();
+		if (Role == ROLE_Authority)
+			MemeModPawn(AOCOwner).MemeEndStrike();
+		if (MAtk <= Attack_Sprint)
+		{
+			if (bMContact)
+				AOCOwner.OnActionSucceeded(EPlayerAction(MAtk + EACT_AttackSlash));
+			else
+				AOCOwner.OnActionFailed(EPlayerAction(MAtk + EACT_AttackSlash));
+		}
+	}
+
+	simulated function BeginFire(byte FireModeNum)
+	{
+		local byte Atk, AltB;
+
+		if (FireModeNum == Attack_Parry)
+		{
+			bMChainParry = true;
+			return;
+		}
+		if (MemeDecode(FireModeNum, Atk, AltB) && Atk != Attack_Shove && Atk != Attack_Sprint)
+		{
+			MChainAtk = Atk;
+			bMChainAlt = AltB == 1;
+			bMChainParry = false;
+		}
+	}
+
+	simulated function OnStateAnimationEnd()
+	{
+		if (bMContact && bMChainParry)
+		{
+			if (MemeRemoteOwner())
+				ClientMemeChainParry();
+			MemeEnterParry();
+		}
+		else if (bMContact && MChainAtk != Attack_Null && MAtk != Attack_Shove && MAtk != Attack_Sprint)
+		{
+			if (MemeRemoteOwner())
+				ClientMemeChain(MChainAtk, bMChainAlt);
+			MemeChain();
+		}
+		else
+		{
+			if (bMChainParry)
+				bMBufParry = true;
+			GotoState('MRecovery');
+		}
+	}
+
+	simulated function DoFeintAttack() {}
+}
+
+simulated state MRecovery
+{
+	simulated event BeginState(Name PreviousStateName)
+	{
+		local AnimationInfo Info;
+		local float Len;
+
+		Info = RecoveryAnimations[MAtk];
+		Info.bCombo = bMReleaseCombo && Info.ComboAnimation != '';
+		Info.bForceFullBody = MAtk == Attack_Shove || MAtk == Attack_Sprint;
+		Info.bForce = true;
+		Len = GetRealAnimLength(Info);
+		if (bMContact)
+			Len *= MContactRecoveryScale;
+		else if (MAtk == Attack_Shove)
+			Len = FMax(Len, MKickWhiffRecovery);
+		Info.fAnimationLength = Len;
+		MStateStart = WorldInfo.TimeSeconds;
+		MStateLength = Len;
+		AOCOwner.StateVariables.bCanDodge = true;
+		AOCOwner.RemoveDebuff(EDEBF_ATTACK);
+		AOCOwner.PlayerHUDStartRecovery();
+		AOCOwner.ReplicateCompressedAnimation(Info, EWST_Recovery, MAtk);
+		MemeArm(Len);
+	}
+
+	simulated event EndState(Name NextStateName)
+	{
+		AOCOwner.PlayerHUDStartIdle();
+	}
+
+	simulated function BeginFire(byte FireModeNum)
+	{
+		if (FireModeNum == Attack_Parry && WorldInfo.TimeSeconds >= MStateStart + MStateLength * MRecoveryParryFraction)
+			MemeEnterParry();
+		else
+			MemeBuffer(FireModeNum);
+	}
+
+	simulated function OnStateAnimationEnd()
+	{
+		GotoState('Active');
+	}
+
+	simulated function DoFeintAttack() {}
+}
+
+simulated state MParry
+{
+	simulated event BeginState(Name PreviousStateName)
+	{
+		local AnimationInfo Info;
+
+		CacheWeaponReferences();
+		ClearTimer('MemeFailsafe');
+		AOCOwner.RemoveDebuff(EDEBF_ANIMATION);
+		AOCOwner.ResetRMM();
+		AOCOwner.FinishSprintAttack();
+		SetCurrentFireMode(Attack_Parry);
+		bMBlocked = false;
+		bMGuardHeld = true;
+		bShieldRaised = true;
+		MRiposteUntil = 0.f;
+		MStateStart = WorldInfo.TimeSeconds;
+		MParryWindowEnd = WorldInfo.TimeSeconds + (bEquipShield ? 0.f : MParryWindow);
+		AOCOwner.StateVariables.bIsAttacking = true;
+		AOCOwner.StateVariables.bCanDodge = false;
+		if (bEquipShield)
+			AOCOwner.StateVariables.bIsActiveShielding = true;
+		else
+			AOCOwner.StateVariables.bIsParrying = true;
+		AOCOwner.OnActionInitiated(EACT_Block);
+		AOCOwner.AddDebuff(true, EDEBF_PARRIED, MGuardMoveScale, -1.f, false);
+
+		if (bEquipShield)
+		{
+			Info = WindupAnimations[Attack_Parry];
+			Info.fAnimationLength = AllowedShieldClass.default.fShieldUpLength;
+			AOCOwner.ReplicateCompressedAnimation(Info, EWST_Windup, Attack_Parry);
+		}
+		else
+		{
+			Info = ReleaseAnimations[Attack_Parry];
+			Info.fBlendInTime = 0.1f;
+			AOCOwner.ReplicateCompressedAnimation(Info, EWST_Release, Attack_Parry);
+			SetTimer(MParryWindow, false, 'MemeParryWindowOver');
+		}
+		if (Role == ROLE_Authority && MemeModPawn(AOCOwner) != none)
+			MemeModPawn(AOCOwner).MemeGuardRaised();
+		// Vanilla bots never send LowerShield; Measure bots do, so theirs is only a failsafe.
+		if (AOCOwner.bIsBot)
+			SetTimer(MemeHasMeasureBrain() ? 2.5f : 0.6f, false, 'LowerShield');
+	}
+
+	simulated event EndState(Name NextStateName)
+	{
+		ClearTimer('MemeParryWindowOver');
+		ClearTimer('LowerShield');
+		AOCOwner.StateVariables.bIsParrying = false;
+		AOCOwner.StateVariables.bIsActiveShielding = false;
+		AOCOwner.RemoveDebuff(EDEBF_PARRIED);
+		bShieldRaised = false;
+	}
+
+	simulated function MemeParryWindowOver()
+	{
+		if (!bMGuardHeld)
+			GotoState('MGuardDrop');
+	}
+
+	simulated function LowerShield()
+	{
+		bMGuardHeld = false;
+		if (WorldInfo.TimeSeconds >= MParryWindowEnd)
+			GotoState('MGuardDrop');
+	}
+
+	simulated function BeginFire(byte FireModeNum)
+	{
+		local byte Atk, AltB;
+
+		if (FireModeNum == Attack_Parry || !MemeDecode(FireModeNum, Atk, AltB) || Atk == Attack_Sprint)
+			return;
+		if (MRiposteUntil > 0.f && WorldInfo.TimeSeconds <= MRiposteUntil + MemeRiposteSlack() && Atk != Attack_Shove)
+			MemeBeginAttack(Atk, AltB == 1, false, true);
+		else if (WorldInfo.TimeSeconds >= MParryWindowEnd)
+			MemeBeginAttack(Atk, AltB == 1, false, false);
+	}
+
+	simulated function OnStateAnimationEnd()
+	{
+		if (!bMGuardHeld && WorldInfo.TimeSeconds >= MParryWindowEnd)
+			GotoState('MGuardDrop');
+	}
+
+	simulated function SuccessfulParry(EAttack Type, int Dir) {}
+	simulated function DoFeintAttack() {}
+}
+
+simulated state MGuardDrop
+{
+	simulated event BeginState(Name PreviousStateName)
+	{
+		local AnimationInfo Info;
+
+		Info = RecoveryAnimations[Attack_Parry];
+		Info.fAnimationLength = bMBlocked ? MGuardDropTime : MMissedParryRecovery;
+		AOCOwner.ReplicateCompressedAnimation(Info, EWST_Recovery, Attack_Parry);
+		MemeArm(Info.fAnimationLength);
+	}
+
+	simulated function BeginFire(byte FireModeNum)
+	{
+		MemeBuffer(FireModeNum);
+	}
+
+	simulated function OnStateAnimationEnd()
+	{
+		GotoState('Active');
+	}
+
+	simulated function DoFeintAttack() {}
+}
+
+simulated state MRecoil
+{
+	simulated event BeginState(Name PreviousStateName)
+	{
+		local AnimationInfo Info;
+
+		CacheWeaponReferences();
+		Info = StateAnimations[0];
+		Info.fAnimationLength = MRecoilLength;
+		if (MAtk == Attack_Sprint)
+			Info.fModifiedMovement = 0.0f;
+		MStateStart = WorldInfo.TimeSeconds;
+		MStateLength = MRecoilLength;
+		if (!bMChainAfterRecoil)
+			MChainAtk = Attack_Null;
+		AOCOwner.StateVariables.bCanSprint = false;
+		AOCOwner.StateVariables.bIsParrying = false;
+		AOCOwner.StateVariables.bIsActiveShielding = false;
+		AOCOwner.StateVariables.bCanDodge = true;
+		AOCOwner.RemoveDebuff(EDEBF_ANIMATION);
+		AOCOwner.ReplicateCompressedAnimation(Info, EWST_State, 0);
+		MemeArm(MRecoilLength);
+	}
+
+	simulated function BeginFire(byte FireModeNum)
+	{
+		local byte Atk, AltB;
+
+		if (FireModeNum == Attack_Parry)
+		{
+			if (WorldInfo.TimeSeconds >= MStateStart + MStateLength * 0.5f)
+				MemeEnterParry();
+			else
+				bMBufParry = true;
+			return;
+		}
+		if (bMChainAfterRecoil && MemeDecode(FireModeNum, Atk, AltB) && Atk != Attack_Shove && Atk != Attack_Sprint)
+		{
+			MChainAtk = Atk;
+			bMChainAlt = AltB == 1;
+		}
+		else
+		{
+			MemeBuffer(FireModeNum);
+		}
+	}
+
+	simulated function OnStateAnimationEnd()
+	{
+		if (bMChainAfterRecoil && MChainAtk != Attack_Null)
+			MemeChain();
+		else
+			GotoState('Active');
+	}
+
+	simulated function DoFeintAttack() {}
+}
+
+simulated state MStagger
+{
+	simulated event BeginState(Name PreviousStateName)
+	{
+		local AnimationInfo Info;
+		local EWeaponState WState;
+		local int Index;
+
+		CacheWeaponReferences();
+		AOCOwner.FinishSprintAttack();
+		AOCOwner.FinishLunge();
+		WState = EWST_Flinch;
+		Index = DirectionDazed;
+		if (DirectionDazed < DazedAnimations.Length)
+			Info = DazedAnimations[DirectionDazed];
+		if (Info.AnimationName == '')
+		{
+			Info = StateAnimations[2];
+			WState = EWST_State;
+			Index = 2;
+		}
+		if (MStaggerKind == STG_BREAK && WState == EWST_Flinch)
+			WState = EWST_SpecialDazed;
+		if (MStaggerKind == STG_BREAK)
+		{
+			if (Info.AlternateAnimation != '')
+				Info.AnimationName = Info.AlternateAnimation;
+			Info.fAnimationLength = MStaggerBreak;
+			bMGuardBroken = true;
+		}
+		else if (MStaggerKind == STG_KICK)
+		{
+			Info.fAnimationLength = MStaggerKick;
+		}
+		else
+		{
+			Info.fAnimationLength = MStaggerHit;
+		}
+		MStateStart = WorldInfo.TimeSeconds;
+		MStateLength = Info.fAnimationLength;
+		MChainAtk = Attack_Null;
+		MemeClearBuffer();
+		AOCOwner.StateVariables.bIsAttacking = false;
+		AOCOwner.StateVariables.bIsParrying = false;
+		AOCOwner.StateVariables.bIsActiveShielding = false;
+		AOCOwner.StateVariables.bCanJump = false;
+		AOCOwner.StateVariables.bCanDodge = MStaggerKind != STG_BREAK;
+		AOCOwner.StopJump();
+		AOCOwner.RemoveDebuff(EDEBF_ATTACK);
+		AOCOwner.PlayerHUDFlinched();
+		AOCOwner.ReplicateCompressedAnimation(Info, WState, Index);
+		MemeArm(MStateLength);
+	}
+
+	simulated event EndState(Name NextStateName)
+	{
+		if (MStaggerKind == STG_BREAK && Role == ROLE_Authority)
+			AOCOwner.ConsumeStamina(-FMax(0.f, AOCOwner.MaxStamina * 0.5f - AOCOwner.Stamina));
+		bMGuardBroken = false;
+		AOCOwner.StateVariables.bCanJump = true;
+	}
+
+	simulated function BeginFire(byte FireModeNum)
+	{
+		if (FireModeNum == Attack_Parry && MStaggerKind != STG_BREAK
+			&& WorldInfo.TimeSeconds >= MStateStart + MStateLength * MStaggerParryFraction)
+			MemeEnterParry();
+		else
+			MemeBuffer(FireModeNum);
+	}
+
+	simulated function OnStateAnimationEnd()
+	{
+		GotoState('Active');
+	}
+
+	simulated function DoFeintAttack() {}
+}

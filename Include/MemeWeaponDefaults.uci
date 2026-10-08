@@ -1,0 +1,5 @@
+	MAtk=13
+	MLastAtk=13
+	MChainAtk=13
+	MBufAtk=13
+`include(MemeMod/Include/MemeWeaponTuning.uci)

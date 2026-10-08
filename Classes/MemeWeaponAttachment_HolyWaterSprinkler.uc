@@ -1,0 +1,6 @@
+class MemeWeaponAttachment_HolyWaterSprinkler extends AOCWeaponAttachment_HolyWaterSprinkler;
+
+DefaultProperties
+{
+	WeaponClass=class'MemeWeapon_HolyWaterSprinkler'
+}

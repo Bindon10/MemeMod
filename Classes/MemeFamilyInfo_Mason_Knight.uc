@@ -1,0 +1,32 @@
+class MemeFamilyInfo_Mason_Knight extends AOCFamilyInfo_Mason_Knight;
+
+DefaultProperties
+{
+	NewPrimaryWeapons(0)=(CWeapon=class'MemeWeapon_DoubleAxe')
+	NewPrimaryWeapons(1)=(CWeapon=class'MemeWeapon_PoleAxe')
+	NewPrimaryWeapons(2)=(CWeapon=class'MemeWeapon_Bearded')
+	NewPrimaryWeapons(3)=(CWeapon=class'MemeWeapon_WarHammer')
+	NewPrimaryWeapons(4)=(CWeapon=class'MemeWeapon_Maul')
+	NewPrimaryWeapons(5)=(CWeapon=class'MemeWeapon_GrandMace')
+	NewPrimaryWeapons(6)=(CWeapon=class'MemeWeapon_Longsword')
+	NewPrimaryWeapons(7)=(CWeapon=class'MemeWeapon_SwordOfWar')
+	NewPrimaryWeapons(8)=(CWeapon=class'MemeWeapon_Messer')
+	NewPrimaryWeapons(9)=(CWeapon=class'MemeWeapon_Flail')
+	NewPrimaryWeapons(10)=(CWeapon=class'MemeWeapon_HFlail')
+	NewSecondaryWeapons(0)=(CWeapon=class'MemeWeapon_Mace')
+	NewSecondaryWeapons(1)=(CWeapon=class'MemeWeapon_MorningStar')
+	NewSecondaryWeapons(2)=(CWeapon=class'MemeWeapon_HolyWaterSprinkler')
+	NewSecondaryWeapons(3)=(CWeapon=class'MemeWeapon_Broadsword')
+	NewSecondaryWeapons(4)=(CWeapon=class'MemeWeapon_Falchion')
+	NewSecondaryWeapons(5)=(CWeapon=class'MemeWeapon_NorseSword')
+	PrimaryWeapons(0)=class'MemeWeapon_WarAxe'
+	PrimaryWeapons(1)=class'MemeWeapon_DoubleAxe'
+	PrimaryWeapons(2)=class'MemeWeapon_Longsword'
+	PrimaryWeapons(3)=class'MemeWeapon_Messer'
+	PrimaryWeapons(4)=class'MemeWeapon_Maul'
+	PrimaryWeapons(5)=class'MemeWeapon_MorningStar'
+	PrimaryWeapons(6)=class'MemeWeapon_Broadsword'
+	PrimaryWeapons(7)=class'MemeWeapon_WarHammer'
+	PrimaryWeapons(8)=class'MemeWeapon_Flail'
+	SecondaryWeapons(3)=class'MemeWeapon_BroadDagger'
+}

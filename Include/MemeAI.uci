@@ -1,0 +1,490 @@
+// Measure bot brain, shared by MemeAIController and MemeAIDuelController.
+// Defence is planned from the attacker's real windup; offence punishes openings and keeps steady pressure.
+// Skill (fSkill) sets reaction time, timing error, punish chance and attack rhythm.
+
+var AOCPawn MThreat;          // attacker we planned against
+var float MThreatEnd;         // their windup end when we planned
+var float MPressAt;           // when to raise the block, 0 = no plan
+var float MReleaseAt;         // when to let go of a held block
+var bool bMHolding;
+var bool bMPlanDodge;
+var float MRiposteAt;         // 0 = undecided, -1 = declined
+var int MFeintsInRow;
+
+var float MReactSlow, MReactFast;     // reaction time at skill 0 / 1
+var float MErrSlow, MErrFast;         // parry timing spread at skill 0 / 1
+var float MContactLead;               // strike start to blade contact, roughly
+var float MThreatRange;
+var float MLowPosture;
+var float MAggression;
+var float MAttackGapSlow, MAttackGapFast;   // pressure rhythm at skill 0 / 1
+var float MPunishSlow, MPunishFast;         // chance to punish an opening at skill 0 / 1
+var float MReachSlack;
+var float MNextPressureAt;
+var float MPunishAt;                        // 0 = undecided, -1 = declined
+var bool bMPunishAttack;
+var int MTuneVersion;
+var MemeTuning MTuneRef;
+
+`include(MemeMod/Include/MemeAISync.uci)
+
+event Possess(Pawn aPawn, bool bVehicleTransition)
+{
+	super.Possess(aPawn, bVehicleTransition);
+	MemeResetPlan();
+	SetTimer(0.05f, true, 'MemeThink');
+}
+
+function PawnDied(Pawn P)
+{
+	MemeResetPlan();
+	super.PawnDied(P);
+}
+
+// Vanilla reacts with randomly timed parries; MemeThink owns defence for Meme weapons.
+function NotifyPawnStartingAttack(AOCPawn Sender)
+{
+	if (MemeW() == none)
+		super.NotifyPawnStartingAttack(Sender);
+}
+
+function IMemeWeapon MemeW()
+{
+	if (Pawn == none)
+		return none;
+	return IMemeWeapon(Pawn.Weapon);
+}
+
+function MemeResetPlan()
+{
+	MThreat = none;
+	MPressAt = 0.f;
+	bMHolding = false;
+	bMPlanDodge = false;
+	MRiposteAt = 0.f;
+}
+
+function bool MemeDefending()
+{
+	return MPressAt > 0.f || bMHolding;
+}
+
+function float MemeSkillLerp(float AtZero, float AtOne)
+{
+	return Lerp(AtZero, AtOne, FClamp(fSkill, 0.f, 1.f));
+}
+
+// Roughly normal, mean 0.
+function float MemeJitter(float Spread)
+{
+	return (FRand() + FRand() + FRand() - 1.5f) * Spread;
+}
+
+function bool MemeIsEnemy(Pawn P)
+{
+	if (AOCGame(WorldInfo.Game) != none && !AOCGame(WorldInfo.Game).bIsTeamMode)
+		return true;
+	return P.GetTeamNum() != Pawn.GetTeamNum();
+}
+
+function EAttack MemeRandomAttack()
+{
+	local int R;
+
+	R = Rand(5);
+	if (R == 3)
+		return Attack_AltSlash;
+	if (R == 4)
+		return Attack_AltOverhead;
+	return EAttack(R);
+}
+
+function MemeThink()
+{
+	local IMemeWeapon W;
+
+	MemeSyncTuning();
+	W = MemeW();
+	if (W == none || Pawn.Health <= 0)
+	{
+		MemeResetPlan();
+		return;
+	}
+	fAggressiveBehavior = MAggression;
+	if (AOCPawn(Pawn).Stamina < MLowPosture)
+		fAggressiveBonus = FMin(fAggressiveBonus, -0.6f);
+	if (!IsInState('MeleeAttack') && MemeModPawn(Pawn) != none && MemeModPawn(Pawn).bMemeHoldKey)
+		MemeStopHolding();
+	MemeWatchThreats(W);
+	MemeRunPlan(W);
+	MemeTryRiposte(W);
+	MemeConsiderAttack(W);
+}
+
+// Offence on top of vanilla's once-a-second decision: punish openings, otherwise keep a steady rhythm.
+function MemeConsiderAttack(IMemeWeapon W)
+{
+	local IMemeWeapon TW;
+	local float Now, Dist, Reach, Gap, TheirEnd;
+
+	Now = WorldInfo.TimeSeconds;
+	// MeleeAttack extends MeleeStance, so exclude it explicitly.
+	if (!IsInState('MeleeStance') || IsInState('MeleeAttack') || bRemainStill || bParryOnly || bTurtleOnly || bDodgeOnly || myCombatTarget == none || myCombatTarget.Health <= 0)
+	{
+		MPunishAt = 0.f;
+		return;
+	}
+	if (MemeDefending() || AOCWeapon(Pawn.Weapon) == none || !Pawn.Weapon.IsInState('Active'))
+		return;
+	Dist = VSize(myCombatTarget.Location - Pawn.Location);
+	Reach = CalculateVanillaAttackStartDistance(Attack_Slash) + myCombatTarget.GetCollisionRadius() + MReachSlack;
+	TW = IMemeWeapon(myCombatTarget.Weapon);
+
+	// Openings: whiffs, missed parries, staggers, recoils, feints.
+	if (TW != none && TW.MemeIsVulnerable())
+	{
+		if (Dist > Reach + 60.f)
+			return;
+		if (MPunishAt == 0.f)
+			MPunishAt = FRand() < MemeSkillLerp(MPunishSlow, MPunishFast) ? Now + MemeSkillLerp(MReactSlow, MReactFast) : -1.f;
+		if (MPunishAt > 0.f && Now >= MPunishAt)
+		{
+			MPunishAt = -1.f;
+			bMPunishAttack = true;
+			GotoState('MeleeAttack');
+		}
+		return;
+	}
+	MPunishAt = 0.f;
+
+	// Starting now would trade into their swing; leave that to the defence planner.
+	TheirEnd = 0.f;
+	if (TW != none)
+		TheirEnd = TW.MemeWindupEnd();
+	if (TheirEnd > 0.f && TheirEnd < Now + 0.5f)
+		return;
+
+	if (Now < MNextPressureAt || Dist > Reach * 1.6f)
+		return;
+	Gap = MemeSkillLerp(MAttackGapSlow, MAttackGapFast) * (1.f - 0.3f * FClamp(MAggression, -1.f, 1.f)) * (0.7f + 0.6f * FRand());
+	if (myCombatTarget.Stamina < 40.f)
+		Gap *= 0.6f;
+	MNextPressureAt = Now + Gap;
+	if (AOCPawn(Pawn).Stamina >= MLowPosture || FRand() < 0.3f)
+		GotoState('MeleeAttack');
+}
+
+// Pick the soonest windup aimed at us and plan for it; a morph re-plans if we notice it.
+function MemeWatchThreats(IMemeWeapon W)
+{
+	local AOCPawn P, Best;
+	local IMemeWeapon PW;
+	local float End, BestEnd;
+
+	foreach WorldInfo.AllPawns(class'AOCPawn', P, Pawn.Location, MThreatRange)
+	{
+		if (P == Pawn || P.Health <= 0 || !MemeIsEnemy(P))
+			continue;
+		PW = IMemeWeapon(P.Weapon);
+		if (PW == none)
+			continue;
+		End = PW.MemeWindupEnd();
+		if (End <= 0.f)
+			continue;
+		if ((vector(P.GetViewRotation()) dot Normal(Pawn.Location - P.Location)) < fMenacingDot || !LineOfSightTo(P))
+			continue;
+		if (Best == none || End < BestEnd)
+		{
+			Best = P;
+			BestEnd = End;
+		}
+	}
+	if (Best == none)
+		return;
+	if (Best == MThreat && Abs(BestEnd - MThreatEnd) < 0.03f)
+		return;
+	// A held swing keeps moving its end; keep the plan made at the hold rather than chase it.
+	if (Best == MThreat && IMemeWeapon(Best.Weapon).MemeIsHolding())
+		return;
+	if (Best == MThreat && MPressAt > 0.f && FRand() > fSkill)
+		return;
+	MemePlanDefence(W, Best, BestEnd);
+}
+
+function MemePlanDefence(IMemeWeapon W, AOCPawn P, float End)
+{
+	local float Now, React, Ideal, MyEnd;
+	local bool bGuard;
+
+	Now = WorldInfo.TimeSeconds;
+	if (bMHolding)
+	{
+		MReleaseAt = FMax(MReleaseAt, End + MContactLead + 0.3f);
+		MThreat = P;
+		MThreatEnd = End;
+		return;
+	}
+
+	// Our own swing lands first by more than the initiative window: keep swinging.
+	MyEnd = W.MemeWindupEnd();
+	if (W.MemeIsStriking() || (MyEnd > 0.f && MyEnd < End - 0.1f))
+		return;
+	if (MyEnd > 0.f && (!W.MemeCanFeint() || FRand() > fSkill))
+		return;
+
+	React = MemeSkillLerp(MReactSlow, MReactFast) * (0.85f + 0.3f * FRand());
+	bGuard = W.MemeIsShieldGuard() || FRand() > MemeSkillLerp(0.35f, 0.9f);
+	// Mid-windup the only defence is feinting into guard, and it must happen before our commit.
+	if (MyEnd > 0.f)
+	{
+		MThreat = P;
+		MThreatEnd = End;
+		bMPlanDodge = false;
+		MPressAt = Now + React * 0.5f;
+		MReleaseAt = End + MContactLead + 0.35f;
+		return;
+	}
+	if (AOCPawn(Pawn).Stamina < MLowPosture)
+		bGuard = false;
+	bMPlanDodge = !bGuard && AOCPawn(Pawn).PawnFamily.bCanDodge && FRand() < 0.12f;
+
+	if (bGuard)
+	{
+		Ideal = End - 0.15f + MemeJitter(MemeSkillLerp(MErrSlow, MErrFast));
+		MReleaseAt = End + MContactLead + 0.35f;
+	}
+	else
+	{
+		Ideal = End + MContactLead - 0.125f + MemeJitter(MemeSkillLerp(MErrSlow, MErrFast));
+		MReleaseAt = 0.f;
+	}
+	MThreat = P;
+	MThreatEnd = End;
+	MPressAt = FMax(Now + React, Ideal);
+	if (MReleaseAt == 0.f)
+		MReleaseAt = MPressAt + 0.3f;
+}
+
+function MemeRunPlan(IMemeWeapon W)
+{
+	local IMemeWeapon TW;
+
+	if (MPressAt > 0.f && WorldInfo.TimeSeconds >= MPressAt)
+	{
+		MPressAt = 0.f;
+		TW = none;
+		if (MThreat != none)
+			TW = IMemeWeapon(MThreat.Weapon);
+		// The swing we planned for is gone (feint): skilled bots hold, the rest get baited.
+		if ((TW == none || (!TW.MemeIsWindingUp() && !TW.MemeIsStriking())) && FRand() < fSkill * 0.7f)
+		{
+			MemeResetPlan();
+			return;
+		}
+		// Our own swing passed its commit point before we could feint out of it.
+		if (W.MemeIsWindingUp() && !W.MemeCanFeint())
+		{
+			MemeResetPlan();
+			return;
+		}
+		if (bMPlanDodge && AOCPawn(Pawn).Dodge(DCLICK_Back))
+		{
+			MemeResetPlan();
+			return;
+		}
+		Pawn.StartFire(Attack_Parry);
+		bMHolding = true;
+	}
+	if (bMHolding && WorldInfo.TimeSeconds >= MReleaseAt)
+	{
+		bMHolding = false;
+		MThreat = none;
+		if (AOCWeapon(Pawn.Weapon) != none)
+			AOCWeapon(Pawn.Weapon).LowerShield();
+	}
+}
+
+function MemeTryRiposte(IMemeWeapon W)
+{
+	if (!W.MemeCanRiposte())
+	{
+		if (!W.MemeIsGuarding())
+			MRiposteAt = 0.f;
+		return;
+	}
+	if (MRiposteAt == 0.f)
+	{
+		if (FRand() < MemeSkillLerp(0.3f, 0.9f))
+			MRiposteAt = WorldInfo.TimeSeconds + MemeSkillLerp(0.4f, 0.12f) * (0.8f + 0.4f * FRand());
+		else
+			MRiposteAt = -1.f;
+	}
+	if (MRiposteAt > 0.f && WorldInfo.TimeSeconds >= MRiposteAt)
+	{
+		MRiposteAt = -1.f;
+		bMHolding = false;
+		MPressAt = 0.f;
+		MThreat = none;
+		Pawn.StartFire(MemeRandomAttack());
+	}
+}
+
+function MemeStopHolding()
+{
+	if (MemeModPawn(Pawn) != none)
+		MemeModPawn(Pawn).bMemeHoldKey = false;
+	if (MemeW() != none)
+		MemeW().MemeReleaseHold();
+}
+
+function bool MemeTargetHoldingGuard()
+{
+	local IMemeWeapon TW;
+
+	if (myCombatTarget == none)
+		return false;
+	TW = IMemeWeapon(myCombatTarget.Weapon);
+	if (TW != none)
+		return TW.MemeIsGuarding() && !TW.MemeInParryWindow();
+	return myCombatTarget.StateVariables.bIsParrying || myCombatTarget.StateVariables.bIsActiveShielding;
+}
+
+function bool MemeWantsFeint()
+{
+	return AOCPawn(Pawn).Stamina > MLowPosture + 10.f && FRand() < MemeSkillLerp(0.04f, 0.28f);
+}
+
+function bool MemeWantsMorph()
+{
+	return AOCPawn(Pawn).Stamina > MLowPosture + 10.f && FRand() < MemeSkillLerp(0.f, 0.18f);
+}
+
+function float MemeWindupLeft()
+{
+	local float End;
+
+	End = MemeW().MemeWindupEnd();
+	return End > 0.f ? FMax(End - WorldInfo.TimeSeconds, 0.f) : 0.f;
+}
+
+state MeleeAttack
+{
+	function NotifyPawnStartingAttack(AOCPawn Sender)
+	{
+		global.NotifyPawnStartingAttack(Sender);
+	}
+
+Begin:
+	if (Pawn == none || myCombatTarget == none)
+		Goto('Finish');
+	// Unported weapons (fists, flags, javelins) keep a plain vanilla swing.
+	if (MemeW() == none)
+	{
+		Pawn.StartFire(GetRandomAttack());
+		Sleep(1.0f);
+		Goto('Finish');
+	}
+	DecidedAttack = MemeRandomAttack();
+	StrafeDistance = CalculateVanillaAttackStartDistance(DecidedAttack >= Attack_AltSlash ? EAttack(DecidedAttack - Attack_AltSlash) : DecidedAttack) + myCombatTarget.GetCollisionRadius();
+	if (VSize(Pawn.Location - myCombatTarget.Location) <= StrafeDistance)
+		Goto('Attack');
+
+Movement:
+	if (!ActorReachable(myCombatTarget))
+	{
+		myMoveTarget = myCombatTarget;
+		myDestReachRadius = StrafeDistance;
+		if (!bRemainStill)
+			PushState('LongRangeMove');
+		GotoState('MeleeStance');
+	}
+	while (VSize(Pawn.Location - myCombatTarget.Location) > StrafeDistance + (AOCPawn(Pawn).StateVariables.bIsSprinting ? SprintAttackStartDistance : AttackStartDistance) && !CheckAIMoveStuck())
+	{
+		if (VSize(myCombatTarget.Location - Pawn.Location) >= 800.f)
+			AOCPawn(Pawn).ServerSprintState(true);
+		Sleep(0.2f);
+	}
+	if (VSize(Pawn.Location - myCombatTarget.Location) > StrafeDistance + (AOCPawn(Pawn).StateVariables.bIsSprinting ? SprintAttackStartDistance : AttackStartDistance))
+		Goto('Finish');
+
+Attack:
+	while (MemeDefending())
+		Sleep(0.05f);
+	if (myCombatTarget == none || myCombatTarget.Health <= 0)
+		Goto('Finish');
+	if (!bAttackOnly && MemeTargetHoldingGuard() && (SkillRoll() > 0 || myCombatTarget.Stamina < 35.f))
+	{
+		Pawn.StartFire(Attack_Shove);
+		Sleep(0.8f);
+		Goto('Finish');
+	}
+	myComboPercent = MemeSkillLerp(0.35f, 0.75f) + 0.1f * MAggression;
+	// Sometimes delay the release to break the defender's timing; never on a punish.
+	if (MemeModPawn(Pawn) != none)
+		MemeModPawn(Pawn).bMemeHoldKey = !bMPunishAttack && FRand() < MemeSkillLerp(0.f, 0.2f);
+	if (bRestrictAttacks)
+		Pawn.StartFire(ForcedAttackType);
+	else if (AOCPawn(Pawn).StateVariables.bIsSprinting && AOCPawn(Pawn).bIsSprintMaxSpeed && AOCPawn(Pawn).StateVariables.bCanSprintAttack && AOCPawn(Pawn).PawnFamily.bCanSprintAttack)
+		Pawn.StartFire(Attack_Sprint);
+	else
+		Pawn.StartFire(DecidedAttack);
+	AOCPawn(Pawn).ServerSprintState(false);
+	Sleep(0.05f);
+
+	if (bMPunishAttack)
+	{
+		bMPunishAttack = false;
+		Goto('Strike');
+	}
+	if (MFeintsInRow < 2 && MemeWantsFeint())
+	{
+		Sleep(MemeWindupLeft() * (0.2f + 0.25f * FRand()));
+		if (MemeW().MemeCanFeint() && !MemeDefending())
+		{
+			AOCWeapon(Pawn.Weapon).DoFeintAttack();
+			MFeintsInRow++;
+			Sleep(0.15f + 0.25f * FRand());
+			DecidedAttack = MemeRandomAttack();
+			Goto('Attack');
+		}
+	}
+	else if (MemeWantsMorph())
+	{
+		Sleep(MemeWindupLeft() * 0.25f);
+		if (MemeW().MemeCanFeint() && !MemeDefending())
+			Pawn.StartFire(MemeRandomAttack());
+	}
+	MFeintsInRow = 0;
+
+Strike:
+	while (MemeW().MemeIsWindingUp() && !MemeW().MemeIsHolding())
+		Sleep(0.05f);
+	if (MemeW().MemeIsHolding())
+	{
+		Sleep(0.05f + 0.2f * FRand());
+		MemeStopHolding();
+	}
+	while (MemeW().MemeIsWindingUp())
+		Sleep(0.05f);
+	if (MemeW().MemeIsStriking() && !MemeDefending() && FRand() < myComboPercent)
+	{
+		Sleep(0.08f);
+		Pawn.StartFire(MemeRandomAttack());
+		myComboPercent -= 0.2f;
+	}
+	while (MemeW().MemeIsStriking())
+		Sleep(0.05f);
+	if (MemeW().MemeIsWindingUp())
+		Goto('Strike');
+
+Finish:
+	bMPunishAttack = false;
+	MemeStopHolding();
+	Sleep(0.1f);
+	if (myCombatTarget == none)
+		GotoState('Active');
+	else if (myCombatTarget.Health <= 0)
+		SetNewCombatTarget(none);
+	else
+		GotoState('MeleeStance');
+}

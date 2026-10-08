@@ -1,0 +1,28 @@
+// Shared by every MemeMod game type.
+
+// ?modname=MemeMod only mounts the package; DefaultGame (DefaultMemeMod.ini) calls this to
+// pick our game type from the map prefix. Unknown prefixes (CDW duel) stay vanilla.
+static event class<GameInfo> SetGameType(string MapName, string Options, string Portal)
+{
+	local string Prefix;
+
+	MapName = StripPlayOnPrefix(MapName);
+	Prefix = Caps(Left(MapName, InStr(MapName, "-")));
+
+	if (Prefix == "AOCFFA")
+		return class'MemeModFFA';
+	if (Prefix == "AOCTD")
+		return class'MemeModTD';
+	if (Prefix == "AOCLTS")
+		return class'MemeModLTS';
+	if (Prefix == "AOCTO")
+		return class'MemeModTO';
+	if (Prefix == "AOCDUEL")
+		return class'MemeModDuel';
+	if (Prefix == "AOCKOTH")
+		return class'MemeModKOTH';
+	if (Prefix == "AOCCTF")
+		return class'MemeModCTF';
+
+	return super.SetGameType(MapName, Options, Portal);
+}

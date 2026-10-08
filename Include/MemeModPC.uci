@@ -1,0 +1,330 @@
+// Shared by every MemeMod player controller.
+
+var bool bMemeDebug;
+var bool bMemeNoCues;
+
+// Clamp mouse input during windup and strike before vanilla's own (looser) cap.
+function ProcessViewRotation(float DeltaTime, out Rotator out_ViewRotation, Rotator DeltaRot)
+{
+	local MemeModPawn P;
+	local float YawCap, PitchCap;
+
+	P = MemeModPawn(Pawn);
+	if (P != none && P.GetSwingTurnCaps(YawCap, PitchCap))
+	{
+		DeltaRot.Yaw = FClamp(DeltaRot.Yaw, -YawCap * DeltaTime, YawCap * DeltaTime);
+		DeltaRot.Pitch = FClamp(DeltaRot.Pitch, -PitchCap * DeltaTime, PitchCap * DeltaTime);
+	}
+	super.ProcessViewRotation(DeltaTime, out_ViewRotation, DeltaRot);
+}
+
+// The server sweeps blades from our rotation, so send moves at 60 Hz while swinging.
+function float MemeMoveDelta()
+{
+	local IMemeWeapon W;
+
+	if (Pawn != none)
+	{
+		W = IMemeWeapon(Pawn.Weapon);
+		if (W != none && (W.MemeIsWindingUp() || W.MemeIsStriking()))
+			return 0.0166;
+	}
+	return 0.05;
+}
+
+exec function MemeDebug()
+{
+	ServerMemeDebug(!bMemeDebug);
+}
+
+// Measure never enters vanilla's tracer state, so the vanilla command drives the Meme debug draw.
+exec function aoc_DrawTracer(bool bDraw)
+{
+	super.aoc_DrawTracer(bDraw);
+	ServerMemeDebug(bDraw);
+}
+
+// Standalone, the listen host, or a logged-in admin.
+function bool MemeMayAdmin()
+{
+	return WorldInfo.NetMode == NM_Standalone || IsLocalPlayerController() || (PlayerReplicationInfo != none && PlayerReplicationInfo.bAdmin);
+}
+
+reliable server function ServerMemeDebug(bool bOn)
+{
+	if (bOn && !MemeMayAdmin())
+	{
+		ClientDisplayConsoleMessage("[Measure] debug draw on a server needs adminlogin");
+		return;
+	}
+	bMemeDebug = bOn;
+	ClientMemeDebug(bOn);
+	if (MemeModPawn(Pawn) != none)
+		MemeModPawn(Pawn).bMemeDebugDraw = bOn;
+}
+
+reliable client function ClientMemeDebug(bool bOn)
+{
+	bMemeDebug = bOn;
+	if (!bOn)
+		FlushPersistentDebugLines();
+	ClientDisplayConsoleMessage("[Measure] debug draw" @ (bOn ? "on" : "off"));
+}
+
+exec function MemeCues()
+{
+	ServerMemeCues(!bMemeNoCues);
+}
+
+reliable server function ServerMemeCues(bool bOff)
+{
+	bMemeNoCues = bOff;
+	ClientMemeCues(bOff);
+	if (MemeModPawn(Pawn) != none)
+		MemeModPawn(Pawn).bMemeNoCues = bOff;
+}
+
+reliable client function ClientMemeCues(bool bOff)
+{
+	bMemeNoCues = bOff;
+	ClientDisplayConsoleMessage("[Measure] combat cues" @ (bOff ? "off" : "on"));
+}
+
+// Tracks whether Fire / AltFire are physically down, so replayed presses can't start a delayed release.
+exec function StartFire(optional byte FireModeNum)
+{
+	MemeNoteFireDown(FireModeNum, true);
+	super.StartFire(FireModeNum);
+}
+
+exec function StopFire(optional byte FireModeNum)
+{
+	MemeNoteFireDown(FireModeNum, false);
+	super.StopFire(FireModeNum);
+}
+
+function MemeNoteFireDown(byte FireModeNum, bool bDown)
+{
+	if (MemeModPawn(Pawn) == none)
+		return;
+	if (FireModeNum == 0)
+		MemeModPawn(Pawn).bMemeFireDown0 = bDown;
+	else if (FireModeNum == 1)
+		MemeModPawn(Pawn).bMemeFireDown1 = bDown;
+}
+
+// Bind as: setbind <key> "MemeHold | OnRelease MemeHoldRelease". Holding it delays any attack's release.
+exec function MemeHold()
+{
+	MemeSetHoldKey(true);
+	ServerMemeHold(true);
+}
+
+exec function MemeHoldRelease()
+{
+	MemeSetHoldKey(false);
+	ServerMemeHold(false);
+}
+
+function MemeSetHoldKey(bool bDown)
+{
+	if (MemeModPawn(Pawn) == none)
+		return;
+	MemeModPawn(Pawn).bMemeHoldKey = bDown;
+	if (!bDown && IMemeWeapon(Pawn.Weapon) != none)
+		IMemeWeapon(Pawn.Weapon).MemeReleaseHold();
+}
+
+reliable server function ServerMemeHold(bool bDown)
+{
+	MemeSetHoldKey(bDown);
+}
+
+// MemeTune lists everything, MemeTune <name> shows one, MemeTune <name> <value> sets it for this session.
+exec function MemeTune(optional string TuneName, optional string TuneValue)
+{
+	ServerMemeTune(TuneName, TuneValue);
+}
+
+reliable server function ServerMemeTune(string TuneName, string TuneValue)
+{
+	local MemeTuning T;
+	local int i;
+	local string Line;
+
+	if (!MemeMayAdmin())
+	{
+		ClientDisplayConsoleMessage("[Measure] MemeTune needs adminlogin");
+		return;
+	}
+	T = class'MemeTuning'.static.Get(WorldInfo);
+	if (T == none)
+		return;
+	if (TuneName == "")
+	{
+		for (i = 0; T.NameAt(i) != ""; i++)
+		{
+			Line = Line $ T.NameAt(i) $ "=" $ T.GetByName(T.NameAt(i)) $ "  ";
+			if (i % 5 == 4)
+			{
+				ClientMessage(Line);
+				Line = "";
+			}
+		}
+		if (Line != "")
+			ClientMessage(Line);
+		return;
+	}
+	if (T.GetByName(TuneName) == "" || (TuneValue != "" && !T.SetByName(TuneName, TuneValue)))
+	{
+		ClientDisplayConsoleMessage("[Measure] unknown tunable or bad value:" @ TuneName @ TuneValue $ ". MemeTune with no name lists them");
+		return;
+	}
+	if (TuneValue == "")
+		ClientDisplayConsoleMessage("[Measure]" @ TuneName $ "=" $ T.GetByName(TuneName));
+	else
+		AOCGame(WorldInfo.Game).BroadcastMessage(none, "[Measure] tuning" @ TuneName $ "=" $ T.GetByName(TuneName), EFAC_ALL, true);
+}
+
+event Possess(Pawn inPawn, bool bVehicleTransition)
+{
+	super.Possess(inPawn, bVehicleTransition);
+	if (MemeModPawn(inPawn) != none)
+	{
+		MemeModPawn(inPawn).bMemeDebugDraw = bMemeDebug;
+		MemeModPawn(inPawn).bMemeNoCues = bMemeNoCues;
+	}
+}
+
+// Vanilla ReplicateMove, with the dedicated-server send interval from MemeMoveDelta.
+function ReplicateMove
+(
+	float DeltaTime,
+	vector NewAccel,
+	eDoubleClickDir DoubleClickMove,
+	rotator DeltaRot
+)
+{
+	local SavedMove NewMove, OldMove, AlmostLastMove, LastMove;
+	local byte ClientRoll;
+	local float NetMoveDelta;
+	local int i, NumPlayers;
+	if (Player == None)
+	{
+		return;
+	}
+	MaxResponseTime = Default.MaxResponseTime * WorldInfo.TimeDilation;
+	DeltaTime = ((Pawn != None) ? Pawn.CustomTimeDilation : CustomTimeDilation) * FMin(DeltaTime, MaxResponseTime);
+	if ( SavedMoves != None )
+	{
+		LastMove = SavedMoves;
+		AlmostLastMove = LastMove;
+		OldMove = None;
+		while ( LastMove.NextMove != None )
+		{
+			if ( (OldMove == None) && (Pawn != None) && LastMove.IsImportantMove(LastAckedAccel) )
+			{
+				OldMove = LastMove;
+			}
+			AlmostLastMove = LastMove;
+			LastMove = LastMove.NextMove;
+		}
+	}
+	NewMove = GetFreeMove();
+	if ( NewMove == None )
+	{
+		return;
+	}
+	NewMove.SetMoveFor(self, DeltaTime, NewAccel, DoubleClickMove);
+	bDoubleJump = false;
+	ProcessMove(NewMove.Delta, NewMove.Acceleration, NewMove.DoubleClickMove, DeltaRot);
+	if ( (PendingMove != None) && PendingMove.CanCombineWith(NewMove, Pawn, MaxResponseTime) )
+	{
+		Pawn.SetLocation(PendingMove.GetStartLocation());
+		Pawn.Velocity = PendingMove.StartVelocity;
+		if( PendingMove.StartBase != Pawn.Base )
+		{
+			Pawn.SetBase(PendingMove.StartBase);
+		}
+		Pawn.Floor = PendingMove.StartFloor;
+		NewMove.Delta += PendingMove.Delta;
+		NewMove.SetInitialPosition(Pawn);
+		if ( LastMove == PendingMove )
+		{
+			if ( SavedMoves == PendingMove )
+			{
+				SavedMoves.NextMove = FreeMoves;
+				FreeMoves = SavedMoves;
+				SavedMoves = None;
+			}
+			else
+			{
+				PendingMove.NextMove = FreeMoves;
+				FreeMoves = PendingMove;
+				if ( AlmostLastMove != None )
+				{
+					AlmostLastMove.NextMove = None;
+					LastMove = AlmostLastMove;
+				}
+			}
+			FreeMoves.Clear();
+		}
+		PendingMove = None;
+	}
+	if( Pawn != None )
+	{
+		Pawn.AutonomousPhysics(NewMove.Delta);
+	}
+	else
+	{
+		AutonomousPhysics(DeltaTime);
+	}
+	NewMove.PostUpdate(self);
+	if( SavedMoves == None )
+	{
+		SavedMoves = NewMove;
+	}
+	else
+	{
+		LastMove.NextMove = NewMove;
+	}
+	if ( PendingMove == None )
+	{
+		if(AOCGRI(Worldinfo.GRI).bListenServer)
+		{
+			NumPlayers = 0;
+			for(i = 0; i < WorldInfo.GRI.PRIArray.Length; ++i)
+			{
+				if(!WorldInfo.GRI.PRIArray[i].bBot && !(WorldInfo.GRI.PRIArray[i].UniqueId.Uid.A == 0 && WorldInfo.GRI.PRIArray[i].UniqueId.Uid.B == 0) )
+				{
+					NumPlayers++;
+				}
+			}
+			if( NumPlayers <= 10 )
+			{
+				NetMoveDelta = 0.011;
+			}
+			else
+			{
+				NetMoveDelta = FMax(0.0222,2 * WorldInfo.MoveRepSize/Player.CurrentNetSpeed);
+			}
+		}
+		else
+		{
+			NetMoveDelta = MemeMoveDelta();
+		}
+		if( (WorldInfo.TimeSeconds - ClientUpdateTime) * WorldInfo.TimeDilation < NetMoveDelta )
+		{
+			PendingMove = NewMove;
+			return;
+		}
+	}
+	ClientUpdateTime = WorldInfo.TimeSeconds;
+	ClientRoll = (Rotation.Roll >> 8) & 255;
+	CallServerMove( NewMove,
+			((Pawn == None) ? Location : Pawn.Location),
+			ClientRoll,
+			((Rotation.Yaw & 65535) << 16) + (Rotation.Pitch & 65535),
+			OldMove );
+	PendingMove = None;
+}
