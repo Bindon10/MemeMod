@@ -250,7 +250,7 @@ match a client's built-in default.
 - **Live:** `MemeTune` lists them all, `MemeTune <name>` shows one, and
   `MemeTune <name> <value>` changes it for everyone straight away. It needs admin on a
   server.
-- **Permanent:** uncomment the line in `MemeMod.ini` and restart.
+- **Permanent:** uncomment its `Tune=<name> <value>` line in `MemeMod.ini` and restart. Built-in defaults live in `MemeTuning` because UE3 ignores script defaults for ini-backed settings.
 - **Source of truth:** `tools/gen_tuning.py` holds the list and its defaults, and
   regenerates `MemeTuning.uc`, the defaults and copy includes, and the ini section.
 

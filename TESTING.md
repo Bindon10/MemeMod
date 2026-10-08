@@ -161,7 +161,7 @@ you saw.
 Every tunable is listed, with a comment, in `[MemeMod.MemeTuningConfig]` of `MemeMod.ini`.
 
 - **Try it live:** `MemeTune <name> <value>`. It lasts until the server restarts.
-- **Keep it:** uncomment the line in `MemeMod.ini`, which sits next to `MemeMod.u` in the
+- **Keep it:** uncomment its `Tune=<name> <value>` line in `MemeMod.ini`, which sits next to `MemeMod.u` in the
   cooked folder, and restart.
 - **Change a default** for everyone: edit `tools/gen_tuning.py` and run
   `python tools\gen_tuning.py .` from the mod root.

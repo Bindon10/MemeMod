@@ -113,7 +113,7 @@ def sync(owner, func, simulated):
 def tuning_class():
     out = [HEAD]
     out.append("class MemeTuning extends ReplicationInfo;\n\n")
-    out.append("// Live tunables. The server copies them from MemeTuningConfig (MemeMod.ini) and replicates them, so clients\n")
+    out.append("// Live tunables. The server applies MemeTuningConfig's ini overrides and replicates the result, so clients\n")
     out.append("// predict with the server's values. Admins change them with MemeTune; Version tells consumers to re-copy.\n\n")
     out.append("var int Version;\n")
     for n, t, v, o, _ in T:
@@ -142,13 +142,20 @@ static function MemeTuning Get(WorldInfo WI)
 	return MT;
 }
 
-// Instance values differ from class defaults, so ini overrides replicate even when a client's defaults match.
+// Applies "Tune=<name> <value>" lines from MemeMod.ini on top of the defaults below.
 function LoadConfigValues()
 {
-""")
-    for n, *_ in T:
-        out.append("\t%s = class'MemeTuningConfig'.default.%s;\n" % (n, n))
-    out.append("""	Version = 1;
+	local string L;
+	local int i, Sp;
+
+	for (i = 0; i < class'MemeTuningConfig'.default.Tune.Length; i++)
+	{
+		L = class'MemeTuningConfig'.default.Tune[i];
+		Sp = InStr(L, " ");
+		if (Sp > 0)
+			SetByName(Left(L, Sp), Mid(L, Sp + 1));
+	}
+	Version = 1;
 	bForceNetUpdate = true;
 }
 
@@ -179,21 +186,17 @@ function bool SetByName(string N, string S)
 
 def config_class():
     out = [HEAD, "class MemeTuningConfig extends Object config(Game);\n\n"]
-    out.append("// Reads [MemeMod.MemeTuningConfig] from MemeMod.ini. MemeTuning copies these on the server.\n\n")
-    for n, t, v, o, _ in T:
-        out.append("var config %s %s;\n" % (t, n))
-    out.append("\nDefaultProperties\n{\n")
-    out.append("`include(MemeMod/Include/MemeWeaponTuning.uci)\n")
-    out.append("`include(MemeMod/Include/MemePawnTuning.uci)\n")
-    out.append("`include(MemeMod/Include/MemeAIDefaults.uci)\n}\n")
+    out.append("// Optional overrides from [MemeMod.MemeTuningConfig] in MemeMod.ini, one \"Tune=<name> <value>\" line each.\n")
+    out.append("// UE3 ignores DefaultProperties for config vars, so the defaults live in MemeTuning instead.\n\n")
+    out.append("var config array<string> Tune;\n")
     return "".join(out)
 
 
 def ini_section():
     out = ["[MemeMod.MemeTuningConfig]\n",
-           "; Uncomment a line to override it. Edits apply on server restart; admins can change them live with MemeTune.\n"]
+           "; Remove the ';' from a Tune line to override that value. Applies on server restart; MemeTune changes them live.\n"]
     for n, t, v, o, c in T:
-        out.append("; %s\n;%s=%s\n" % (c, n, val(t, v)))
+        out.append("; %s\n;Tune=%s %s\n" % (c, n, val(t, v)))
     return "".join(out)
 
 
